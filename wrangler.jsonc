@@ -1,0 +1,75 @@
+/**
+ * For more details on how to configure Wrangler, refer to:
+ * https://developers.cloudflare.com/workers/wrangler/configuration/
+ */
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "cloudflare-prometheus-exporter",
+	"main": "src/worker.tsx",
+	"compatibility_date": "2025-12-09",
+	"compatibility_flags": ["nodejs_compat"],
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": [
+				"MetricExporter",
+				"MetricCoordinator",
+				"AccountMetricCoordinator"
+			]
+		}
+	],
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "MetricCoordinator",
+				"class_name": "MetricCoordinator"
+			},
+			{
+				"name": "AccountMetricCoordinator",
+				"class_name": "AccountMetricCoordinator"
+			},
+			{
+				"name": "MetricExporter",
+				"class_name": "MetricExporter"
+			}
+		]
+	},
+	"observability": {
+		"enabled": true
+	},
+	"kv_namespaces": [
+		{
+			"binding": "CONFIG_KV",
+			"id": "00a2791809ca4be696e942e244a4f501"
+		}
+	],
+	"ratelimits": [
+		{
+			"name": "CF_API_RATE_LIMITER",
+			"namespace_id": "1",
+			"simple": {
+				"limit": 200,
+				"period": 10
+			}
+		}
+	],
+	"vars": {
+		"QUERY_LIMIT": 10000,
+		"SCRAPE_DELAY_SECONDS": 300,
+		"TIME_WINDOW_SECONDS": 60,
+		"METRIC_REFRESH_INTERVAL_SECONDS": 60,
+		"LOG_FORMAT": "json",
+		"LOG_LEVEL": "info",
+		"ACCOUNT_LIST_CACHE_TTL_SECONDS": 600,
+		"ZONE_LIST_CACHE_TTL_SECONDS": 1800,
+		"SSL_CERTS_CACHE_TTL_SECONDS": 1800,
+		"HOST_METRICS_ALLOWLIST": " ",
+		"HOST_METRICS_DELAY_SECONDS": 60,
+		"EXCLUDE_HOST": false,
+		"CF_HTTP_STATUS_GROUP": false,
+		"COLO_METRICS_PACKED_STORAGE": false,
+		"METRICS_PATH": "/metrics",
+		"DISABLE_UI": false,
+		"DISABLE_CONFIG_API": false
+	}
+}
