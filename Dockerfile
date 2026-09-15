@@ -14,31 +14,33 @@ FROM node:24-slim AS runtime
 
 WORKDIR /app
 
-# Install CA certificates for TLS and wrangler globally
+# Install CA certificates for Cloudflare API calls. Wrangler is installed from the lockfile and
+# invoked from node_modules so the runtime cannot drift independently of the application.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && npm install -g wrangler
+    && rm -rf /var/lib/apt/lists/*
 
 # Copy dependencies from bun stage
-COPY --from=deps /app/node_modules ./node_modules
+COPY --from=deps --chown=node:node /app/node_modules ./node_modules
 
 # Copy application source
-COPY package.json wrangler.jsonc tsconfig.json ./
-COPY src ./src
+COPY --chown=node:node package.json wrangler.jsonc tsconfig.json ./
+COPY --chown=node:node src ./src
 
 # Expose the default wrangler dev port
 EXPOSE 8787
 
-# Create entrypoint script that generates .dev.vars from environment variables
-# Wrangler expects secrets in .dev.vars file, not shell env vars
+# Create an entrypoint that passes only supported Worker variables into Wrangler. Keeping an
+# explicit allowlist avoids leaking Kubernetes' injected service variables into .dev.vars.
 RUN printf '#!/bin/sh\n\
-    # Generate .dev.vars from environment variables\n\
     : > .dev.vars\n\
-    env | grep -E "^(CLOUDFLARE_|CF_)" | while read -r line; do\n\
+    env | grep -E "^(CLOUDFLARE_API_TOKEN|QUERY_LIMIT|SCRAPE_DELAY_SECONDS|TIME_WINDOW_SECONDS|METRIC_REFRESH_INTERVAL_SECONDS|ACCOUNT_LIST_CACHE_TTL_SECONDS|ZONE_LIST_CACHE_TTL_SECONDS|SSL_CERTS_CACHE_TTL_SECONDS|HEALTH_CHECK_CACHE_TTL_SECONDS|LOG_FORMAT|LOG_LEVEL|CF_ACCOUNTS|CF_ZONES|CF_FREE_TIER_ACCOUNTS|METRICS_DENYLIST|EXCLUDE_HOST|CF_HTTP_STATUS_GROUP|COLO_METRICS_PACKED_STORAGE|HOST_METRICS_ALLOWLIST|HOST_METRICS_DELAY_SECONDS|METRICS_PATH|DISABLE_UI|DISABLE_CONFIG_API|BASIC_AUTH_USER|BASIC_AUTH_PASSWORD)=" | while read -r line; do\n\
     echo "$line" >> .dev.vars\n\
     done\n\
-    exec wrangler dev --local --ip 0.0.0.0 "$@"\n' > /app/entrypoint.sh \
-    && chmod +x /app/entrypoint.sh
+    exec ./node_modules/.bin/wrangler dev --local --ip 0.0.0.0 "$@"\n' > /app/entrypoint.sh \
+    && chmod +x /app/entrypoint.sh \
+    && chown node:node /app/entrypoint.sh /app
+
+USER node
 
 ENTRYPOINT ["/app/entrypoint.sh"]
