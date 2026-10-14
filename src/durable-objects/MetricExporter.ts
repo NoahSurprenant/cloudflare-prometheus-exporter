@@ -43,6 +43,11 @@ const STATE_KEY = "state";
 const STATE_PACKED_COLO_METRICS_KEY = "packed-colo-metrics";
 const ALARM_RECOVERY_DELAY_MS = 60 * 1000;
 /**
+ * How many refresh intervals an alarm may be overdue before the coordinator's
+ * periodic context push treats it as lost and refreshes directly.
+ */
+const LOST_ALARM_GRACE_INTERVALS = 2;
+/**
  * Maximum allowed hostnames in HOST_METRICS_ALLOWLIST.
  * Limits GraphQL variable size and prevents cardinality explosion.
  */
@@ -94,6 +99,8 @@ type MetricFetchResult = {
 export class MetricExporter extends DurableObject<Env> {
 	private state: MetricExporterState | undefined;
 	private stateLoadFailed = false;
+	/** The refresh currently running, so overlapping callers share it instead of fetching twice. */
+	private refreshInFlight: Promise<void> | undefined;
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
@@ -255,8 +262,10 @@ export class MetricExporter extends DurableObject<Env> {
 
 		// On first context push, fetch immediately then schedule recurring alarm
 		if (isFirstContext) {
-			await this.refreshWithTimeRange(timeRange, config, logger);
+			await this.refreshOnce(timeRange, config, logger);
+			return;
 		}
+		await this.recoverLostAlarm(timeRange, config, logger);
 	}
 
 	/**
@@ -299,8 +308,96 @@ export class MetricExporter extends DurableObject<Env> {
 
 		// On first init, fetch immediately then schedule recurring alarm
 		if (isFirstInit) {
-			await this.refreshWithTimeRange(timeRange, config, logger);
+			await this.refreshOnce(timeRange, config, logger);
+			return;
 		}
+		await this.recoverLostAlarm(timeRange, config, logger);
+	}
+
+	/**
+	 * Restart the refresh cycle if its alarm has been lost.
+	 *
+	 * The cycle lives entirely in this object's alarm: each refresh schedules the
+	 * next one. If an alarm is dropped (seen under `wrangler dev --local`, where
+	 * alarms persisted in storage did not fire again after a restart), nothing
+	 * else ever refreshes the object and it serves its last metrics forever. The
+	 * coordinator pushes context every refresh interval, so this check runs that
+	 * often and repairs a missing or long-overdue alarm within one interval.
+	 *
+	 * It cannot stampede the API: it does nothing while the alarm is healthy,
+	 * only reschedules when the last successful refresh is under one interval
+	 * old, joins a refresh that is already running, and goes through the same
+	 * refresh path as the alarm (SSL cache TTL, backoff delays, rate limiter).
+	 *
+	 * @param timeRange Shared time range from the coordinator.
+	 * @param config Resolved runtime configuration.
+	 * @param logger Logger instance.
+	 */
+	private async recoverLostAlarm(
+		timeRange: TimeRange,
+		config: ResolvedConfig,
+		logger: Logger,
+	): Promise<void> {
+		const alarm = await this.ctx.storage.getAlarm();
+		const intervalMs = config.metricRefreshIntervalSeconds * 1000;
+		const now = Date.now();
+		if (
+			alarm !== null &&
+			alarm >= now - LOST_ALARM_GRACE_INTERVALS * intervalMs
+		) {
+			return;
+		}
+
+		const state = this.getState();
+		const context = {
+			alarm: alarm === null ? null : new Date(alarm).toISOString(),
+			last_refresh:
+				state.lastRefresh > 0
+					? new Date(state.lastRefresh).toISOString()
+					: null,
+		};
+		if (
+			this.refreshInFlight === undefined &&
+			now - state.lastRefresh < intervalMs
+		) {
+			logger.warn("Refresh alarm lost, rescheduling", context);
+			await this.scheduleNextAlarm(config);
+			return;
+		}
+
+		logger.warn("Refresh alarm lost, refreshing now", context);
+		await this.refreshOnce(timeRange, config, logger);
+	}
+
+	/**
+	 * Run a refresh, or join the one already running.
+	 *
+	 * Durable Objects interleave calls while a request awaits the network, so the
+	 * alarm, the coordinator and lost-alarm recovery could otherwise fetch the
+	 * same data at the same time.
+	 *
+	 * @param timeRange Time range for metrics queries.
+	 * @param config Resolved runtime configuration.
+	 * @param logger Logger instance.
+	 */
+	private refreshOnce(
+		timeRange: TimeRange,
+		config: ResolvedConfig,
+		logger: Logger,
+	): Promise<void> {
+		if (this.refreshInFlight !== undefined) {
+			logger.debug("Refresh already running, joining it");
+			return this.refreshInFlight;
+		}
+		const refresh = this.refreshWithTimeRange(
+			timeRange,
+			config,
+			logger,
+		).finally(() => {
+			if (this.refreshInFlight === refresh) this.refreshInFlight = undefined;
+		});
+		this.refreshInFlight = refresh;
+		return refresh;
 	}
 
 	/**
@@ -321,7 +418,7 @@ export class MetricExporter extends DurableObject<Env> {
 					config.scrapeDelaySeconds,
 					config.timeWindowSeconds,
 				);
-				await this.refreshWithTimeRange(timeRange, config, logger);
+				await this.refreshOnce(timeRange, config, logger);
 			},
 			getLogger: () => logger,
 			scheduleRecoveryAlarm: () =>
@@ -338,7 +435,7 @@ export class MetricExporter extends DurableObject<Env> {
 	async triggerRefresh(timeRange: TimeRange): Promise<void> {
 		const config = await getConfig(this.env);
 		const logger = this.createLogger(config);
-		await this.refreshWithTimeRange(timeRange, config, logger);
+		await this.refreshOnce(timeRange, config, logger);
 	}
 
 	/**

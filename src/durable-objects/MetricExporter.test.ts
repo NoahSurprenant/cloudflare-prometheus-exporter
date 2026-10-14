@@ -3,7 +3,11 @@ import { z } from "zod";
 import { MetricExporter } from "./MetricExporter";
 
 class AlarmStorage {
-	readonly setAlarm = vi.fn().mockResolvedValue(undefined);
+	alarm: number | null = null;
+	readonly setAlarm = vi.fn(async (scheduledTime: number) => {
+		this.alarm = scheduledTime;
+	});
+	readonly getAlarm = vi.fn(async () => this.alarm);
 	getManyFailures = 0;
 	readonly values = new Map<string, unknown>();
 
@@ -384,5 +388,192 @@ describe("MetricExporter packed colo storage", () => {
 		h.setPacked(true);
 		await h.refresh(3);
 		expect(await h.requests()).toEqual([10]);
+	});
+});
+
+describe("MetricExporter lost-alarm recovery", () => {
+	const DAY_MS = 24 * 60 * 60 * 1000;
+	const timeRange = {
+		mintime: new Date(Date.now() - 120_000).toISOString(),
+		maxtime: new Date(Date.now() - 60_000).toISOString(),
+	};
+	const zone = {
+		id: "zone-id",
+		name: "example.com",
+		status: "active",
+		plan: { id: "paid", name: "Paid" },
+		account: { id: "account-id", name: "Account" },
+	};
+	const certExpiry = "2027-01-03T20:34:46.000Z";
+
+	function certPacksResponse(): Response {
+		return new Response(
+			JSON.stringify({
+				success: true,
+				errors: [],
+				messages: [],
+				result: [
+					{
+						id: "pack-id",
+						type: "universal",
+						status: "active",
+						primary_certificate: "cert-id",
+						hosts: ["example.com", "*.example.com"],
+						certificates: [
+							{
+								id: "cert-id",
+								issuer: "GoogleTrustServices",
+								status: "active",
+								expires_on: certExpiry,
+							},
+						],
+					},
+				],
+			}),
+			{ headers: { "content-type": "application/json" } },
+		);
+	}
+
+	function workerTotalsResponse(): Response {
+		return new Response(
+			JSON.stringify({
+				data: { viewer: { accounts: [{ workersInvocationsAdaptive: [] }] } },
+			}),
+			{ headers: { "content-type": "application/json" } },
+		);
+	}
+
+	async function harness(
+		state: Record<string, unknown>,
+		respond: () => Response | Promise<Response>,
+	) {
+		const storage = new AlarmStorage();
+		storage.values.set("state", state);
+		const fetch = vi
+			.fn<typeof globalThis.fetch>()
+			.mockImplementation(async () => respond());
+		vi.stubGlobal("fetch", fetch);
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		const { exporter, ready } = createExporter(storage, {
+			CLOUDFLARE_API_TOKEN: "token",
+			CONFIG_KV: { get: vi.fn().mockResolvedValue(null) },
+			// A fresh limiter per test: the client singleton is cached per limiter.
+			CF_API_RATE_LIMITER: {
+				limit: vi.fn().mockResolvedValue({ success: true }),
+			},
+		});
+		await ready;
+		return { storage, fetch, exporter };
+	}
+
+	function staleZoneState(): Record<string, unknown> {
+		const monthAgo = Date.now() - 27 * DAY_MS;
+		return {
+			...storedState(),
+			scopeType: "zone",
+			scopeId: zone.id,
+			queryName: "ssl-certificates",
+			zoneMetadata: zone,
+			lastRefresh: monthAgo,
+			lastSslFetch: monthAgo,
+		};
+	}
+
+	function staleAccountState(): Record<string, unknown> {
+		return {
+			...storedState(),
+			zones: [zone],
+			lastRefresh: Date.now() - 27 * DAY_MS,
+		};
+	}
+
+	it("refreshes a zone exporter whose alarm is long overdue and reschedules it", async () => {
+		const h = await harness(staleZoneState(), certPacksResponse);
+		h.storage.alarm = Date.now() - 27 * DAY_MS;
+
+		await h.exporter.initializeZone(zone, "account-id", "Account", timeRange);
+
+		expect(h.fetch).toHaveBeenCalledOnce();
+		expect(h.storage.alarm).toBeGreaterThan(Date.now());
+		const metrics = await h.exporter.export();
+		expect(metrics[0]?.values[0]?.value).toBe(
+			new Date(certExpiry).getTime() / 1000,
+		);
+	});
+
+	it("refreshes an account exporter whose alarm is missing", async () => {
+		const h = await harness(staleAccountState(), workerTotalsResponse);
+		h.storage.alarm = null;
+
+		await h.exporter.updateZoneContext(
+			"account-id",
+			"Account",
+			[zone],
+			{},
+			timeRange,
+		);
+
+		expect(h.fetch).toHaveBeenCalledOnce();
+		expect(h.storage.alarm).toBeGreaterThan(Date.now());
+	});
+
+	it("leaves a scheduled or briefly late alarm alone", async () => {
+		const h = await harness(staleZoneState(), certPacksResponse);
+
+		for (const alarm of [Date.now() + 30_000, Date.now() - 90_000]) {
+			h.storage.alarm = alarm;
+			await h.exporter.initializeZone(zone, "account-id", "Account", timeRange);
+		}
+
+		expect(h.fetch).not.toHaveBeenCalled();
+		expect(h.storage.setAlarm).not.toHaveBeenCalled();
+	});
+
+	it("only reschedules when the last refresh is under one interval old", async () => {
+		const h = await harness(
+			{ ...staleAccountState(), lastRefresh: Date.now() - 10_000 },
+			workerTotalsResponse,
+		);
+		h.storage.alarm = null;
+
+		await h.exporter.updateZoneContext(
+			"account-id",
+			"Account",
+			[zone],
+			{},
+			timeRange,
+		);
+
+		expect(h.fetch).not.toHaveBeenCalled();
+		expect(h.storage.setAlarm).toHaveBeenCalledOnce();
+		expect(h.storage.alarm).toBeGreaterThan(Date.now());
+	});
+
+	it("shares one refresh between the coordinator push and the alarm", async () => {
+		let release: () => void = () => {};
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const h = await harness(staleAccountState(), async () => {
+			await gate;
+			return workerTotalsResponse();
+		});
+		h.storage.alarm = null;
+
+		const push = () =>
+			h.exporter.updateZoneContext(
+				"account-id",
+				"Account",
+				[zone],
+				{},
+				timeRange,
+			);
+		const calls = [push(), push(), h.exporter.alarm()];
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		release();
+		await Promise.all(calls);
+
+		expect(h.fetch).toHaveBeenCalledOnce();
+		expect(h.storage.alarm).toBeGreaterThan(Date.now());
 	});
 });
