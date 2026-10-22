@@ -26,21 +26,20 @@ COPY --from=deps --chown=node:node /app/node_modules ./node_modules
 # Copy application source
 COPY --chown=node:node package.json wrangler.jsonc tsconfig.json ./
 COPY --chown=node:node src ./src
+COPY --chown=node:node run.mjs ./
 
-# Expose the default wrangler dev port
+# Bundle the Worker once at build time (no Cloudflare account needed for a dry run); run.mjs serves
+# dist/worker.js.
+RUN ./node_modules/.bin/wrangler deploy --dry-run --outdir dist \
+    && rm -rf .wrangler
+
+# The Worker's port
 EXPOSE 8787
 
-# Create an entrypoint that passes only supported Worker variables into Wrangler. Keeping an
-# explicit allowlist avoids leaking Kubernetes' injected service variables into .dev.vars.
-RUN printf '#!/bin/sh\n\
-    : > .dev.vars\n\
-    env | grep -E "^(CLOUDFLARE_API_TOKEN|QUERY_LIMIT|SCRAPE_DELAY_SECONDS|TIME_WINDOW_SECONDS|METRIC_REFRESH_INTERVAL_SECONDS|ACCOUNT_LIST_CACHE_TTL_SECONDS|ZONE_LIST_CACHE_TTL_SECONDS|SSL_CERTS_CACHE_TTL_SECONDS|HEALTH_CHECK_CACHE_TTL_SECONDS|LOG_FORMAT|LOG_LEVEL|CF_ACCOUNTS|CF_ZONES|CF_FREE_TIER_ACCOUNTS|METRICS_DENYLIST|EXCLUDE_HOST|CF_HTTP_STATUS_GROUP|COLO_METRICS_PACKED_STORAGE|HOST_METRICS_ALLOWLIST|HOST_METRICS_DELAY_SECONDS|METRICS_PATH|DISABLE_UI|DISABLE_CONFIG_API|BASIC_AUTH_USER|BASIC_AUTH_PASSWORD)=" | while read -r line; do\n\
-    echo "$line" >> .dev.vars\n\
-    done\n\
-    exec ./node_modules/.bin/wrangler dev --local --ip 0.0.0.0 "$@"\n' > /app/entrypoint.sh \
-    && chmod +x /app/entrypoint.sh \
-    && chown node:node /app/entrypoint.sh /app
+# run.mjs passes only an allowlist of Worker variables from the environment, so Kubernetes' injected
+# service variables never reach the Worker.
+RUN chown node:node /app
 
 USER node
 
-ENTRYPOINT ["/app/entrypoint.sh"]
+ENTRYPOINT ["node", "run.mjs"]
