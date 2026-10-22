@@ -34,7 +34,7 @@ What kind of metric are you adding?
 | 1 | `src/cloudflare/gql/queries.ts` | Add `graphql()` tagged template (skip for REST) |
 | 2 | `src/cloudflare/queries.ts` | Add to `MetricQueryNameSchema` enum + category arrays |
 | 3 | `src/cloudflare/client.ts` | Import query, add switch case, implement handler |
-| 4 | `src/durable-objects/MetricExporter.ts` | Only if special guardrails needed (e.g. allowlists) |
+| 4 | `src/lib/metric-query.ts` | Only if special guardrails needed (e.g. allowlists) |
 | 5 | `README.md` | Add metric docs + update architecture diagram counts |
 
 ## Key Conventions

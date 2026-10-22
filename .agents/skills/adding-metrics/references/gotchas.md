@@ -51,23 +51,23 @@ Adding a query name to `ACCOUNT_LEVEL_QUERIES` without adding a switch case prod
 
 **Source**: PR #14, opencode session `happy-garden`
 
-If your zone-level query uses adaptive analytics, add to `PAID_TIER_GRAPHQL_QUERIES`. The MetricExporter DO auto-filters free-tier zones before calling your handler. Forgetting this causes GraphQL errors like `"does not have access to the path"` for free-tier zones.
+If your zone-level query uses adaptive analytics, add to `PAID_TIER_GRAPHQL_QUERIES`. MetricQuery auto-filters free-tier zones before calling your handler. Forgetting this causes GraphQL errors like `"does not have access to the path"` for free-tier zones.
 
 Conversely, REST API metrics (`ssl-certificates`, `lb-weight-metrics`) must NOT be in `PAID_TIER_GRAPHQL_QUERIES` -- they work on free tier.
 
-## DO Created Even When Disabled
+## Query Run Even When Disabled
 
 **Source**: opencode session `happy-garden` (Finding #1, HIGH severity)
 
-`AccountMetricCoordinator` creates a MetricExporter DO for every query in `ACCOUNT_SCOPED_QUERIES`, even if the feature is disabled (e.g. `hostname-http-metrics` with empty allowlist). The DO runs alarms every 60s and returns empty.
+`AccountMetricCoordinator` runs a MetricQuery for every active query in `ACCOUNT_SCOPED_QUERIES`, even if the feature is disabled (e.g. `hostname-http-metrics` with empty allowlist), unless it is gated. The query then runs every 60s and returns empty.
 
-**Lesson**: If your metric has an enable/disable condition, consider gating DO creation in `AccountMetricCoordinator.refreshZonesAndPushContext()`, not just returning empty from the handler.
+**Lesson**: If your metric has an enable/disable condition, consider gating it in `getActiveAccountQueries()` in `AccountMetricCoordinator`, not just returning empty from the handler.
 
 ## Counter Semantics
 
-Cloudflare API returns **window totals** (e.g. "1234 requests in the last 60s"). The MetricExporter DO accumulates these into monotonically increasing counters.
+Cloudflare API returns **window totals** (e.g. "1234 requests in the last 60s"). MetricQuery accumulates these into monotonically increasing counters.
 
-**Your handler must return the raw window delta**, not a pre-accumulated value. The DO handles accumulation via `processCounters()`.
+**Your handler must return the raw window delta**, not a pre-accumulated value. MetricQuery handles accumulation via `processCounters()`.
 
 If you incorrectly return accumulated values from your handler, the DO will double-count.
 
@@ -102,7 +102,7 @@ Hostname metrics (session `happy-garden`) cap at 50 hostnames via `MAX_HOSTNAME_
 
 ## Error Handling Inconsistency
 
-Account-level handlers return `[]` on error (soft fail). Zone-level handlers throw (caught by chunk error handling). Either works -- MetricExporter catches both. But be consistent within your handler category.
+Account-level handlers return `[]` on error (soft fail). Zone-level handlers throw (caught by chunk error handling). Either works -- MetricQuery catches both. But be consistent within your handler category.
 
 ## README Architecture Diagram
 

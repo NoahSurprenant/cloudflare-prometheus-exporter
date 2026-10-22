@@ -7,10 +7,17 @@ import { HttpResponse, http } from "msw";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { z } from "zod";
 import { CLOUDFLARE_GQL_URL } from "../../src/cloudflare/client";
-import type { MetricExporter } from "../../src/durable-objects/MetricExporter";
+import type { AccountMetricCoordinator } from "../../src/durable-objects/AccountMetricCoordinator";
+import {
+	chunkedDurableObjectStorage,
+	loadChunkedValue,
+} from "../../src/lib/chunked-storage";
+import { getEnvDefaults } from "../../src/lib/runtime-config";
 import { COLO_METRIC_SCENARIOS, type ColoMetricScenario } from "./scenarios";
 
 const network = setupNetwork();
+
+const COLO_QUERY = /query ColoMetrics(PackedStorage)?\(/;
 
 function createColoGroups(scenario: ColoMetricScenario) {
 	const { colosPerZone, hostsPerColo, trafficPerHost } = scenario.scale;
@@ -33,7 +40,7 @@ beforeAll(() => network.enable());
 afterEach(() => network.resetHandlers());
 afterAll(() => network.disable());
 
-describe("colo-metrics Durable Object", () => {
+describe("colo-metrics in AccountMetricCoordinator", () => {
 	it.each(COLO_METRIC_SCENARIOS)("$path $name", async (scenario) => {
 		const accountId = scenario.name.replaceAll(" ", "-");
 		const zones = Array.from({ length: scenario.scale.zones }, (_, index) => ({
@@ -47,10 +54,19 @@ describe("colo-metrics Durable Object", () => {
 		let graphQLRequests = 0;
 		network.use(
 			http.post(CLOUDFLARE_GQL_URL, async ({ request }) => {
-				graphQLRequests++;
 				const body = z
-					.object({ variables: z.object({ zoneIDs: z.array(z.string()) }) })
+					.object({
+						query: z.string(),
+						variables: z.object({ zoneIDs: z.array(z.string()).optional() }),
+					})
 					.parse(await request.json());
+				// Every other query of the account gets an empty answer.
+				if (!COLO_QUERY.test(body.query)) {
+					return HttpResponse.json({
+						data: { viewer: { zones: [], accounts: [] } },
+					});
+				}
+				graphQLRequests++;
 				const requestedZones = new Set(body.variables.zoneIDs);
 				return HttpResponse.json({
 					data: {
@@ -65,26 +81,43 @@ describe("colo-metrics Durable Object", () => {
 					},
 				});
 			}),
+			// Zone-scoped REST queries (SSL certificates, load balancers).
+			http.all("https://api.cloudflare.com/client/v4/*", () =>
+				HttpResponse.json({
+					success: true,
+					errors: [],
+					messages: [],
+					result: [],
+				}),
+			),
 		);
-		const exporterId = `account:${accountId}:${scenario.path.metric}`;
-		const stub = env.MetricExporter.getByName(exporterId);
-		await stub.initialize(exporterId);
-		await stub.updateZoneContext(
-			accountId,
-			accountId,
-			zones,
-			{},
-			{
-				mintime: "2026-01-01T00:00:00.000Z",
-				maxtime: "2026-01-01T00:01:00.000Z",
-			},
-		);
+
+		const stub = env.AccountMetricCoordinator.getByName(`account:${accountId}`);
+		// Seed a cached zone list so the refresh runs only metric queries.
+		await runInDurableObject(stub, async (_instance, state) => {
+			await state.storage.put("state", {
+				accountId,
+				accountName: accountId,
+				zones,
+				totalZoneCount: zones.length,
+				firewallRules: {},
+				lastZoneFetch: Date.now(),
+				lastRefresh: 0,
+			});
+		});
+		await evictDurableObject(stub);
+
+		const packedColoStorage = getEnvDefaults(env).coloMetricsPackedStorage;
+		const options = { accountId, accountName: accountId, packedColoStorage };
+		await stub.exportForPrometheus(options);
 
 		const lastError = await runInDurableObject(
 			stub,
-			async (_instance: MetricExporter, state) => {
-				const stored = await state.storage.get<{ lastError: string | null }>(
-					"state",
+			async (_instance: AccountMetricCoordinator, state) => {
+				const stored = await loadChunkedValue(
+					chunkedDurableObjectStorage(state.storage),
+					`query:account:${accountId}:colo-metrics`,
+					z.object({ lastError: z.string().nullable() }),
 				);
 				return stored?.lastError;
 			},
@@ -93,29 +126,43 @@ describe("colo-metrics Durable Object", () => {
 		expect(graphQLRequests).toBe(Math.ceil(scenario.scale.zones / 10));
 
 		await evictDurableObject(stub);
-		const snapshot = await stub.exportPackedColoMetrics();
+		const result = await stub.exportForPrometheus(options);
+		// The scrape after eviction serves stored results without refetching.
+		expect(graphQLRequests).toBe(Math.ceil(scenario.scale.zones / 10));
+
 		const expectedRecords =
 			scenario.scale.zones *
 			scenario.scale.colosPerZone *
 			scenario.scale.hostsPerColo;
+		const { trafficPerHost } = scenario.scale;
+		if (!packedColoStorage) {
+			const requests = result.metrics.find(
+				(metric) => metric.name === "cloudflare_zone_colocation_requests_total",
+			);
+			expect(requests?.values).toHaveLength(expectedRecords);
+			expect(
+				requests?.values.every(
+					(value) => value.value === trafficPerHost.requests,
+				),
+			).toBe(true);
+			return;
+		}
+
+		const snapshot = result.packedColoMetrics[0];
 		expect(
 			snapshot?.zones.reduce((total, zone) => total + zone.colo.length, 0),
 		).toBe(expectedRecords);
 		for (const zone of snapshot?.zones ?? []) {
 			expect(
-				zone.visits.every(
-					(value) => value === scenario.scale.trafficPerHost.visits,
-				),
+				zone.visits.every((value) => value === trafficPerHost.visits),
 			).toBe(true);
 			expect(
 				zone.edgeResponseBytes.every(
-					(value) => value === scenario.scale.trafficPerHost.responseBytes,
+					(value) => value === trafficPerHost.responseBytes,
 				),
 			).toBe(true);
 			expect(
-				zone.requests.every(
-					(value) => value === scenario.scale.trafficPerHost.requests,
-				),
+				zone.requests.every((value) => value === trafficPerHost.requests),
 			).toBe(true);
 		}
 	});

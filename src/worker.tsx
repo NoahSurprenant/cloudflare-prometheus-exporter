@@ -17,7 +17,7 @@ import {
 	setConfigKey,
 } from "./lib/runtime-config";
 
-export { MetricCoordinator, AccountMetricCoordinator, MetricExporter };
+export { AccountMetricCoordinator, MetricCoordinator, MetricExporter };
 
 type Variables = { config: AppConfig };
 
@@ -86,7 +86,7 @@ app.get(env.METRICS_PATH, async (c) => {
 	logger.info("Metrics request received");
 
 	try {
-		const coordinator = await MetricCoordinator.get(c.env);
+		const coordinator = MetricCoordinator.get(c.env);
 		const response = await coordinator.fetch(
 			"https://metric-coordinator/export",
 		);
