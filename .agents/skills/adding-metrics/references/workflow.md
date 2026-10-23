@@ -114,7 +114,7 @@ Add to three places:
 2. Add case to `getZoneMetrics()` switch (before `default`)
 3. Implement handler -- uses `findZoneName(zoneData.zoneTag, zones)` for zone labels
 
-Zone chunking (max 10 zones per call) is handled automatically by MetricExporter DO.
+Zone chunking (max 10 zones per call) is handled automatically by MetricQuery.
 
 ### B4-B5. Same as A4-A5.
 
@@ -144,9 +144,9 @@ public async getMyMetricForZone(zone: Zone): Promise<MetricDefinition[]> { ... }
 
 Also implement a private batched version and wire it into `getZoneMetrics()` switch.
 
-### C3. Wire MetricExporter DO
+### C3. Wire MetricQuery
 
-**File**: `src/durable-objects/MetricExporter.ts`
+**File**: `src/lib/metric-query.ts`
 
 Add case to `fetchZoneScopedMetrics()` switch. This switch is NOT exhaustive (plain string comparison), so TS won't catch missing cases.
 

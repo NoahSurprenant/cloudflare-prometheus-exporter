@@ -9,6 +9,13 @@ import { MetricCoordinator } from "./MetricCoordinator";
 
 const requestsName = "cloudflare_zone_colocation_requests_total";
 
+const exportCalls: {
+	id: string;
+	accountId: string;
+	accountName: string;
+	packedColoStorage: boolean;
+}[] = [];
+
 type Row = { host: string; value: number; misses?: number };
 
 function packedState(rows: Row[]): PackedColoMetricState {
@@ -90,28 +97,34 @@ async function createCoordinator(
 				JSON.stringify({ coloMetricsPackedStorage: true, ...overrides }),
 		},
 		AccountMetricCoordinator: {
+			// No initialize RPC: the account coordinator initializes itself from
+			// the identity passed with each export.
 			getByName: (id: string) => ({
-				initialize: async () => {},
 				// Mirrors AccountMetricCoordinator: the caller's mode decides which
 				// representation colo metrics use for this scrape.
 				exportForPrometheus: async (options: {
+					accountId: string;
+					accountName: string;
 					packedColoStorage: boolean;
-				}) => ({
-					metrics:
-						id === "account:account-a" || options.packedColoStorage
-							? []
-							: legacy,
-					packedColoMetrics:
-						id === "account:account-a" && options.packedColoStorage
-							? packed
-							: [],
-					zoneCounts: {
-						total: 1,
-						filtered: 1,
-						processed: 1,
-						skippedFreeTier: 0,
-					},
-				}),
+				}) => {
+					exportCalls.push({ id, ...options });
+					return {
+						metrics:
+							id === "account:account-a" || options.packedColoStorage
+								? []
+								: legacy,
+						packedColoMetrics:
+							id === "account:account-a" && options.packedColoStorage
+								? packed
+								: [],
+						zoneCounts: {
+							total: 1,
+							filtered: 1,
+							processed: 1,
+							skippedFreeTier: 0,
+						},
+					};
+				},
 			}),
 		},
 	};
@@ -134,6 +147,32 @@ function coloOutput(output: string): string[] {
 
 afterEach(() => {
 	vi.restoreAllMocks();
+	exportCalls.length = 0;
+});
+
+describe("MetricCoordinator account fan-out", () => {
+	it("makes one export call per account, passing the account identity", async () => {
+		const coordinator = await createCoordinator([]);
+		const response = await coordinator.fetch(
+			new Request("https://test/export"),
+		);
+		await response.text();
+
+		expect(exportCalls).toEqual([
+			{
+				id: "account:account-a",
+				accountId: "account-a",
+				accountName: "A",
+				packedColoStorage: true,
+			},
+			{
+				id: "account:account-b",
+				accountId: "account-b",
+				accountName: "B",
+				packedColoStorage: true,
+			},
+		]);
+	});
 });
 
 describe("MetricCoordinator packed colo output", () => {

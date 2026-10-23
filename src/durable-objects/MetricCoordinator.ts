@@ -12,6 +12,7 @@ import type { Account } from "../lib/types";
 import { AccountMetricCoordinator } from "./AccountMetricCoordinator";
 
 const STATE_KEY = "state";
+const COORDINATOR_ID = "metric-coordinator";
 
 type MetricCoordinatorState = {
 	identifier: string;
@@ -26,15 +27,14 @@ export class MetricCoordinator extends DurableObject<Env> {
 	private state: MetricCoordinatorState | undefined;
 
 	/**
-	 * Gets or creates singleton MetricCoordinator instance.
+	 * Gets singleton MetricCoordinator instance. The coordinator initializes
+	 * itself on its first export, so no setup call is made here.
 	 *
 	 * @param env Worker environment bindings.
-	 * @returns Initialized MetricCoordinator stub.
+	 * @returns MetricCoordinator stub.
 	 */
-	static async get(env: Env) {
-		const stub = env.MetricCoordinator.getByName("metric-coordinator");
-		await stub.setIdentifier("metric-coordinator");
-		return stub;
+	static get(env: Env) {
+		return env.MetricCoordinator.getByName(COORDINATOR_ID);
 	}
 
 	/**
@@ -64,15 +64,17 @@ export class MetricCoordinator extends DurableObject<Env> {
 	}
 
 	/**
-	 * Initializes coordinator state if not already set.
-	 *
-	 * @param id Unique identifier for this coordinator instance.
+	 * Initializes coordinator state on first use. No-op once initialized.
 	 */
-	async setIdentifier(id: string): Promise<void> {
+	private async ensureInitialized(): Promise<void> {
 		if (this.state !== undefined) {
 			return;
 		}
-		this.state = { identifier: id, accounts: [], lastAccountFetch: 0 };
+		this.state = {
+			identifier: COORDINATOR_ID,
+			accounts: [],
+			lastAccountFetch: 0,
+		};
 		await this.ctx.storage.put(STATE_KEY, this.state);
 	}
 
@@ -155,6 +157,7 @@ export class MetricCoordinator extends DurableObject<Env> {
 	}
 
 	private async exportResponse(): Promise<Response> {
+		await this.ensureInitialized();
 		const config = await getConfig(this.env);
 		const logger = this.createLogger(config);
 
@@ -219,14 +222,12 @@ export class MetricCoordinator extends DurableObject<Env> {
 
 		for (const account of accounts) {
 			try {
-				const coordinator = await AccountMetricCoordinator.get(
-					account.id,
-					account.name,
-					this.env,
-				);
+				const coordinator = AccountMetricCoordinator.get(account.id, this.env);
 				// Resolve the storage mode once per scrape so every account serializes
 				// colo metrics the same way; mixed modes would duplicate HELP/TYPE lines.
 				const result = await coordinator.exportForPrometheus({
+					accountId: account.id,
+					accountName: account.name,
 					packedColoStorage: config.coloMetricsPackedStorage,
 				});
 				allMetrics.push(...result.metrics);

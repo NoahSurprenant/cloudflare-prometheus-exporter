@@ -6,23 +6,23 @@ export type { MetricDefinition, MetricType, MetricValue } from "./metrics";
 export { MetricDefinitionSchema } from "./metrics";
 
 /**
- * Zod schema for MetricExporter scope: account-level or zone-level.
+ * Zod schema for metric query scope: account-level or zone-level.
  */
 export const ScopeTypeSchema = z.enum(["account", "zone"]);
 
 /**
- * Scope discriminator for MetricExporter DOs.
+ * Scope discriminator for metric queries.
  */
 export type ScopeType = z.infer<typeof ScopeTypeSchema>;
 
 /**
- * String literal type for MetricExporter DO IDs: "scope:id:queryName".
+ * String literal type for metric query IDs: "scope:id:queryName".
  */
 export type MetricExporterIdString =
 	`${"account" | "zone"}:${string}:${string}`;
 
 /**
- * Zod schema that parses and validates MetricExporter DO ID strings.
+ * Zod schema that parses and validates metric query ID strings.
  * Transforms "scope:id:query" into structured object.
  */
 export const MetricExporterIdSchema = z
@@ -38,7 +38,7 @@ export const MetricExporterIdSchema = z
 	});
 
 /**
- * Parsed MetricExporter DO identifier with scope, ID, and query name.
+ * Parsed metric query identifier with scope, ID, and query name.
  */
 export type MetricExporterId = z.infer<typeof MetricExporterIdSchema>;
 

@@ -12,7 +12,7 @@ Cloudflare Prometheus exporter: Worker + Durable Objects fetching CF metrics via
 ```
 src/
   worker.tsx           # Entry: Hono app + DO exports
-  durable-objects/     # 3 DOs: MetricCoordinator → AccountMetricCoordinator → MetricExporter
+  durable-objects/     # DOs: MetricCoordinator → AccountMetricCoordinator (MetricExporter is retired)
   lib/                 # Shared: types, config, prometheus serialization, logging
   cloudflare/          # CF API client + GraphQL queries
     gql/               # Generated: schema.gql, graphql-env.d.ts (DO NOT EDIT)
@@ -34,8 +34,9 @@ src/
 | Symbol | Type | Location | Role |
 |--------|------|----------|------|
 | `MetricCoordinator` | DO | `durable-objects/MetricCoordinator.ts` | Singleton, owns account list, delegates to AccountMetricCoordinator |
-| `AccountMetricCoordinator` | DO | `durable-objects/AccountMetricCoordinator.ts` | Per-account, manages zone list + MetricExporter DOs |
-| `MetricExporter` | DO | `durable-objects/MetricExporter.ts` | Per-query scope, fetches + caches metrics, handles counter accumulation |
+| `AccountMetricCoordinator` | DO | `durable-objects/AccountMetricCoordinator.ts` | Per-account, manages zone list, runs all MetricQuery instances on its alarm |
+| `MetricQuery` | Class | `lib/metric-query.ts` | Per-query scope (in-process), fetches + caches metrics, handles counter accumulation |
+| `MetricExporter` | DO | `durable-objects/MetricExporter.ts` | Retired; kept for the migration, clears leftover storage |
 | `CloudflareMetricsClient` | Class | `cloudflare/client.ts` | GraphQL + REST client, DataLoader batching |
 | `getConfig` | Fn | `lib/runtime-config.ts` | Merges KV overrides with env defaults |
 | `serializeToPrometheus` | Fn | `lib/prometheus.ts` | MetricDefinition[] → text format |
@@ -77,7 +78,9 @@ src/
 
 ## UNIQUE STYLES
 
-**DO ID format:** `"scope:id:queryName"` (e.g., `"account:abc123:http-metrics"`)
+**Query ID format:** `"scope:id:queryName"` (e.g., `"account:abc123:http-metrics"`)
+
+**No per-query DOs:** every cross-DO call leaks native memory under `wrangler dev --local` (workerd#6894); keep scrape and alarm paths free of extra DO calls
 
 **Metric types:** Only `counter` and `gauge` (no histogram/summary)
 

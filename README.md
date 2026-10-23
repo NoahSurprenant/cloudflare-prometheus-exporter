@@ -528,7 +528,7 @@ For mixed accounts (enterprise + free zones), only free zones are skipped—paid
 │  │  State: accounts[], lastAccountFetch                                    │   │
 │  │  Cache TTL: 600s (account list)                                         │   │
 │  └─────────────────────────────────────────────────────────────────────────┘   │
-│                               │ RPC                                            │
+│                               │ RPC (1 call per account per scrape)            │
 │                  ┌────────────┼────────────┐                                   │
 │                  ▼            ▼            ▼                                   │
 │  ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐                   │
@@ -537,17 +537,11 @@ For mixed accounts (enterprise + free zones), only free zones are skipped—paid
 │  │ account:acct1   │ │ account:acct2   │ │ account:acct3   │                   │
 │  │ Alarm: 60s      │ │ Alarm: 60s      │ │ Alarm: 60s      │                   │
 │  │ Zone TTL: 1800s │ │ Zone TTL: 1800s │ │ Zone TTL: 1800s │                   │
-│  └───────┬─────────┘ └───────┬─────────┘ └───────┬─────────┘                   │
-│          │ RPC               │                   │                             │
-│   ┌──────┴─────┐      ┌──────┴─────┐      ┌──────┴─────┐                       │
-│   ▼            ▼      ▼            ▼      ▼            ▼                       │
-│ ┌─────┐    ┌─────┐  ┌─────┐    ┌─────┐  ┌─────┐    ┌─────┐                     │
-│ │Exprt│    │Exprt│  │Exprt│    │Exprt│  │Exprt│    │Exprt│                     │
-│ │(21) │ .. │(N)  │  │(21) │ .. │(N)  │  │(21) │ .. │(N)  │                     │
-│ │acct │    │zone │  │acct │    │zone │  │acct │    │zone │                     │
-│ └─────┘    └─────┘  └─────┘    └─────┘  └─────┘    └─────┘                     │
+│  │ Metric queries  │ │ Metric queries  │ │ Metric queries  │                   │
+│  │ (in-process)    │ │ (in-process)    │ │ (in-process)    │                   │
+│  └─────────────────┘ └─────────────────┘ └─────────────────┘                   │
 │                                                                                │
-│  MetricExporter DOs (per account):                                             │
+│  Metric queries per account (MetricQuery, run inside the coordinator):         │
 │  - Account-scoped (21): worker-totals, logpush-account, magic-transit,         │
 │    magic-transit-slo, magic-transit-traffic, magic-firewall-samples,           │
 │    network-analytics, stream-video-playback, stream-live-inputs,              │
@@ -566,6 +560,14 @@ For mixed accounts (enterprise + free zones), only free zones are skipped—paid
 │  └─────────────────────────────────────────────────────────────────────────┘   │
 └────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+Metric queries run in-process rather than as Durable Objects of their own: under
+`wrangler dev --local` every cross-object call leaks native memory
+([workerd#6894](https://github.com/cloudflare/workerd/issues/6894)), so a scrape
+makes one call to MetricCoordinator and one per account, and alarms make none.
+The `MetricExporter` class remains only so existing deployments keep a valid
+migration; leftover instances clear their storage when their old alarm fires.
+Upgrading from a release that ran them starts accumulated counters from zero once.
 
 ### Request Path: Prometheus Scrape (GET /metrics)
 
@@ -591,28 +593,17 @@ For mixed accounts (enterprise + free zones), only free zones are skipped—paid
 │ Coordinator    │    │ Coordinator    │    │ Coordinator    │
 │ (Account A)    │    │ (Account B)    │    │ (Account C)    │
 │                │    │                │    │                │
-│ 1. Check if    │    │                │    │                │
-│    refresh()   │    │  (parallel)    │    │  (parallel)    │
-│    needed      │    │                │    │                │
-│ 2. Fan out to  │    │                │    │                │
-│    exporters   │    │                │    │                │
+│ 1. Refresh if  │    │                │    │                │
+│    stale or    │    │  (parallel)    │    │  (parallel)    │
+│    alarm lost  │    │                │    │                │
+│ 2. Return      │    │                │    │                │
+│    cached      │    │                │    │                │
+│    metrics     │    │                │    │                │
 └───────┬────────┘    └───────┬────────┘    └───────┬────────┘
         │                     │                     │
-  ┌─────┴─────┐         ┌─────┴─────┐         ┌─────┴─────┐
-  ▼           ▼         ▼           ▼         ▼           ▼
-┌─────┐   ┌─────┐    ┌─────┐   ┌─────┐    ┌─────┐   ┌─────┐
-│Exprt│...│Exprt│    │Exprt│...│Exprt│    │Exprt│...│Exprt│
-│21+N │   │     │    │21+N │   │     │    │21+N │   │     │
-│     │   │     │    │     │   │     │    │     │   │     │
-│ ret │   │ ret │    │ ret │   │ ret │    │ ret │   │ ret │
-│cache│   │cache│    │cache│   │cache│    │cache│   │cache│
-└──┬──┘   └──┬──┘    └──┬──┘   └──┬──┘    └──┬──┘   └──┬──┘
-   │         │          │         │          │         │
-   └────┬────┘          └────┬────┘          └────┬────┘
-        │                    │                    │
-        └────────────────────┼────────────────────┘
-                             │
-                             ▼
+        └─────────────────────┼─────────────────────┘
+                              │
+                              ▼
                    ┌─────────────────┐
                    │  FAN-IN: Merge  │
                    │  all metrics +  │
@@ -637,9 +628,9 @@ For mixed accounts (enterprise + free zones), only free zones are skipped—paid
 
 ```
 ┌──────────────────────────────────────────────┐
-│           ALARM TRIGGERS                     │
-│ AccountMetricCoordinator: every 60s          │
-│ MetricExporter: every 60s + 1-5s fixed jitter│
+│           ALARM TRIGGER                      │
+│ AccountMetricCoordinator: every 60s, aligned │
+│ to the minute + 1-5s jitter                  │
 └──────────────────────────────────────────────┘
 ```
 
@@ -661,53 +652,28 @@ For mixed accounts (enterprise + free zones), only free zones are skipped—paid
 │     │           └─► DataLoader batches parallel calls                │ │
 │     └────────────────────────────────────────────────────────────────┘ │
 │                                                                        │
-│  3. Push context to MetricExporter DOs:                                │
+│  3. Run every metric query that is due (parallel, one shared           │
+│     time range):                                                       │
 │     ┌────────────────────────────────────────────────────────────────┐ │
-│     │ Account-scoped (21 exporters):                                 │ │
-│     │   exporter.updateZoneContext(accountId, accountName, zones)    │ │
+│     │ ACCOUNT-LEVEL (single account per query, 9):                   │ │
+│     │   worker-totals, logpush-account, magic-transit,               │ │
+│     │   magic-transit-slo, magic-transit-traffic,                    │ │
+│     │   magic-firewall-samples, network-analytics,                   │ │
+│     │   stream-video-playback, stream-live-inputs                    │ │
 │     │                                                                │ │
-│     │ Zone-scoped (N exporters, 1 per zone):                         │ │
-│     │   exporter.initializeZone(zone, accountId, accountName)        │ │
+│     │ ZONE-LEVEL (all zones batched in one query, 12):               │ │
+│     │   http-metrics, adaptive-metrics, edge-country-metrics,        │ │
+│     │   colo-metrics, colo-error-metrics, request-method-metrics,    │ │
+│     │   health-check-metrics, load-balancer-metrics, logpush-zone,   │ │
+│     │   origin-status-metrics, cache-miss-metrics,                   │ │
+│     │   hostname-http-metrics                                        │ │
+│     │                                                                │ │
+│     │ ZONE-SCOPED REST (1 per zone, cached for SSL cert TTL):        │ │
+│     │   ssl-certificates, lb-weight-metrics                          │ │
 │     └────────────────────────────────────────────────────────────────┘ │
+│     After fetch: Process counters → Store metrics → Next refresh time  │
 │                                                                        │
-│  4. Schedule next alarm (60s)                                          │
-└────────────────────────────────────────────────────────────────────────┘
-```
-
-**MetricExporter.alarm()**
-
-```
-┌────────────────────────────────────────────────────────────────────────┐
-│           MetricExporter.refresh() for account-scoped queries          │
-│                                                                        │
-│  Query Types (21 total):                                               │
-│  ├── ACCOUNT-LEVEL (single account per query, 9):                      │
-│  │   ├── worker-totals                                                 │
-│  │   ├── logpush-account                                               │
-│  │   ├── magic-transit                                                 │
-│  │   ├── magic-transit-slo                                             │
-│  │   ├── magic-transit-traffic                                         │
-│  │   ├── magic-firewall-samples                                        │
-│  │   ├── network-analytics                                             │
-│  │   ├── stream-video-playback                                         │
-│  │   └── stream-live-inputs                                            │
-│  │                                                                     │
-│  └── ZONE-LEVEL (all zones batched in one query, 12):                  │
-│      ├── http-metrics                                                  │
-│      ├── adaptive-metrics                                              │
-│      ├── edge-country-metrics                                          │
-│      ├── colo-metrics                                                  │
-│      ├── colo-error-metrics                                            │
-│      ├── request-method-metrics                                        │
-│      ├── health-check-metrics                                          │
-│      ├── load-balancer-metrics                                         │
-│      ├── logpush-zone                                                  │
-│      ├── origin-status-metrics                                         │
-│      ├── cache-miss-metrics                                            │
-│      └── hostname-http-metrics                                         │
-│                                                                        │
-│  After fetch: Process counters → Cache metrics → Schedule next alarm   │
-│  Jitter: 1-5s fixed (tighter clustering for time range alignment)      │
+│  4. Schedule next alarm (next minute boundary + 1-5s jitter)           │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 

@@ -465,7 +465,7 @@ export class CloudflareMetricsClient {
 
 	/**
 	 * Fetches account-level metrics for a specific query type.
-	 * Each MetricExporter DO calls this directly - no batching needed since
+	 * Each MetricQuery calls this directly - no batching needed since
 	 * Cloudflare's accounts filter only supports single accountTag.
 	 *
 	 * @param query Account-level query name.
@@ -3321,7 +3321,7 @@ export class CloudflareMetricsClient {
 
 	/**
 	 * Fetches SSL certificate metrics for a single zone.
-	 * Used by zone-scoped MetricExporter DOs.
+	 * Used by zone-scoped metric queries.
 	 *
 	 * @param zone Zone metadata.
 	 * @returns Promise of SSL certificate metrics.
@@ -3369,7 +3369,7 @@ export class CloudflareMetricsClient {
 
 	/**
 	 * Fetches LB origin weight metrics for a single zone.
-	 * Used by zone-scoped MetricExporter DOs.
+	 * Used by zone-scoped metric queries.
 	 *
 	 * @param zone Zone metadata.
 	 * @returns Promise of LB weight metrics.
